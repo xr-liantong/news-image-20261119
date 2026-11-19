@@ -1,199 +1,253 @@
-// Entry for make.fun "news-image-20261119" — Thursday 19 November 2026, one front page.
+// make.fun "news-image" 2026-11-19 — hand today's front page to the grader.
 //
-// The program has one job: hand the finished front page to the grader. It finds entry.png
-// next to itself, proves that file is a PNG or a JPEG inside the competition's 1024x1024 and
-// 1 MiB gate, and copies it byte for byte into the output directory. Nothing is written when
-// a check fails, so a broken entry fails loudly here instead of being scored as a blank page.
+// The page lives next to this module as entry.png. Before a single byte reaches the
+// output directory the file must prove it is a still PNG or a JPEG inside the 1024x1024
+// and 1 MiB gate; a file that fails any rule stops here with exit 1 and leaves nothing
+// behind, so a bad entry is loud instead of silently scored as a blank page.
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const SIDE_LIMIT = 1024;
-const BYTE_LIMIT = 1024 * 1024;
+const SIDE_MAX = 1024;
+const BYTES_MAX = 1024 * 1024;
 
-const PNG_SIGNATURE = Buffer.from('89504e470d0a1a0a', 'hex');
-const JPEG_SIGNATURE = Buffer.from('ffd8ff', 'hex');
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const JPEG_MAGIC = Buffer.from([0xff, 0xd8, 0xff]);
 
-interface Size {
-  width: number;
-  height: number;
+interface Geometry {
+  readonly format: 'png' | 'jpeg';
+  readonly width: number;
+  readonly height: number;
 }
 
-/** The CRC-32 the PNG specification puts at the end of every chunk. */
+/** CRC-32 as PNG defines it: polynomial 0xEDB88320, both ends XOR 0xFFFFFFFF. */
 function crc32(bytes: Buffer): number {
-  let crc = 0xffffffff;
-  for (const byte of bytes) {
-    crc ^= byte;
+  let value = 0xffffffff;
+  for (let index = 0; index < bytes.length; index += 1) {
+    value ^= bytes.readUInt8(index);
     for (let bit = 0; bit < 8; bit += 1) {
-      crc = (crc & 1) === 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+      value = (value & 1) === 1 ? (value >>> 1) ^ 0xedb88320 : value >>> 1;
     }
   }
-  return (crc ^ 0xffffffff) >>> 0;
+  return (value ^ 0xffffffff) >>> 0;
+}
+
+function hex(value: number): string {
+  return `0x${value.toString(16).padStart(2, '0')}`;
 }
 
 /**
- * A PNG starts with an IHDR chunk of exactly 13 bytes: width and height as big-endian 32-bit
- * values at offsets 16 and 20 of the file. Its CRC covers the chunk type and the data, so a
- * header that was edited by hand is caught here rather than trusted.
+ * A PNG header is fixed by the spec: after the 8-byte signature comes a chunk whose
+ * length must be 13 and whose type must be IHDR. Verifying its CRC is what separates a
+ * real header from bytes somebody patched by hand to pass a size check.
  */
-function pngSize(bytes: Buffer): Size {
+function pngGeometry(bytes: Buffer): { width: number; height: number } {
   if (bytes.length < 33) {
-    throw new Error('PNG ends before its IHDR chunk');
+    throw new Error(`entry.png is ${bytes.length} bytes, too short for a PNG IHDR chunk`);
   }
   const declared = bytes.readUInt32BE(8);
   const type = bytes.toString('latin1', 12, 16);
   if (declared !== 13 || type !== 'IHDR') {
-    throw new Error(`PNG does not start with a 13-byte IHDR chunk (found ${type})`);
+    throw new Error(
+      `entry.png starts with chunk "${type}" of ${declared} bytes where a 13-byte IHDR belongs`,
+    );
   }
-  if (crc32(bytes.subarray(12, 29)) !== bytes.readUInt32BE(29)) {
-    throw new Error('PNG IHDR chunk fails its own CRC');
+  const stored = bytes.readUInt32BE(29);
+  const computed = crc32(bytes.subarray(12, 29));
+  if (stored !== computed) {
+    throw new Error(
+      `entry.png IHDR CRC mismatch: stored 0x${stored.toString(16)}, computed 0x${computed.toString(16)}`,
+    );
+  }
+  const bitDepth = bytes.readUInt8(24);
+  const colourType = bytes.readUInt8(25);
+  const compression = bytes.readUInt8(26);
+  const filter = bytes.readUInt8(27);
+  const interlace = bytes.readUInt8(28);
+  if (![1, 2, 4, 8, 16].includes(bitDepth) || ![0, 2, 3, 4, 6].includes(colourType)) {
+    throw new Error(
+      `entry.png IHDR declares bit depth ${bitDepth} and colour type ${colourType}, which PNG does not allow`,
+    );
+  }
+  if (compression !== 0 || filter !== 0 || interlace > 1) {
+    throw new Error(
+      `entry.png IHDR uses unsupported compression ${compression}, filter ${filter} or interlace ${interlace}`,
+    );
   }
   return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
 }
 
-/** Markers with no length field of their own: the two signatures and the restart markers. */
-function standsAlone(marker: number): boolean {
+/**
+ * An animated PNG keeps its frames in an acTL chunk; a grader that keeps only the first
+ * frame would score a still of the page rather than the page, so it is refused outright.
+ */
+function rejectAnimation(bytes: Buffer): void {
+  let offset = 8;
+  while (offset + 12 <= bytes.length) {
+    const length = bytes.readUInt32BE(offset);
+    const type = bytes.toString('latin1', offset + 4, offset + 8);
+    if (type === 'acTL') {
+      throw new Error('entry.png is an animated PNG (acTL chunk); the page must be one still frame');
+    }
+    if (type === 'IEND') {
+      return;
+    }
+    if (offset + 12 + length > bytes.length) {
+      throw new Error(
+        `entry.png is not a valid PNG: chunk "${type}" at byte ${offset} claims ${length} bytes past the end of the file`,
+      );
+    }
+    offset += length + 12;
+  }
+  throw new Error('entry.png is not a valid PNG: the chunk list ends without an IEND chunk');
+}
+
+/** Markers that carry no length field: TEM and the restart markers RST0–RST7. */
+function isStandalone(marker: number): boolean {
   return marker === 0x01 || (marker >= 0xd0 && marker <= 0xd9);
 }
 
-/** Start-of-frame markers: FFC0–FFCF except DHT, JPG and DAC, which share the range. */
+/** Start-of-frame markers: C0–CF minus DHT (C4), JPG (C8) and DAC (CC). */
 function startsFrame(marker: number): boolean {
-  return marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker);
+  return marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
 }
 
 /**
- * A JPEG keeps its size in the start-of-frame segment, which sits somewhere in the marker chain
- * after the signature. Segments are stepped over by their own length; inside the entropy-coded
- * scan a 0xFF is only a marker when the next byte is not zero, so compressed data is not read
- * as a header by accident.
+ * A JPEG hides its size in the first start-of-frame segment of the marker chain. Segments
+ * are skipped by their own length field; inside entropy-coded scan data a 0xFF only starts
+ * a marker when the following byte is not 0x00, so compressed bytes are not read as headers.
  */
-function jpegSize(bytes: Buffer): Size {
-  if (bytes.length < 4) {
-    throw new Error('JPEG ends before its first segment');
-  }
-  let at = 2;
-  let inScan = false;
-  while (at < bytes.length) {
-    if (bytes[at] !== 0xff) {
-      if (!inScan) {
-        throw new Error(`JPEG marker chain breaks at byte ${at}`);
+function jpegGeometry(bytes: Buffer): { width: number; height: number } {
+  let offset = 2;
+  let insideScan = false;
+  while (offset < bytes.length) {
+    const current = bytes.readUInt8(offset);
+    if (current !== 0xff) {
+      if (!insideScan) {
+        throw new Error(
+          `entry.png is not a valid JPEG: expected a marker at byte ${offset}, found ${hex(current)}`,
+        );
       }
-      at += 1;
+      offset += 1;
       continue;
     }
-    let mark = at;
-    while (mark + 1 < bytes.length && bytes[mark + 1] === 0xff) {
-      mark += 1;
+    let start = offset;
+    while (start + 1 < bytes.length && bytes.readUInt8(start + 1) === 0xff) {
+      start += 1;
     }
-    if (mark + 1 >= bytes.length) {
+    if (start + 1 >= bytes.length) {
       break;
     }
-    const marker = bytes[mark + 1];
-    at = mark + 2;
+    const marker = bytes.readUInt8(start + 1);
+    offset = start + 2;
     if (marker === 0x00) {
-      if (!inScan) {
-        throw new Error(`JPEG has a stuffed 0xFF outside a scan at byte ${mark}`);
+      if (!insideScan) {
+        throw new Error(`entry.png is not a valid JPEG: stuffed 0xFF outside scan data at byte ${start}`);
       }
       continue;
     }
-    if (standsAlone(marker)) {
-      inScan = false;
+    if (isStandalone(marker)) {
+      insideScan = false;
       continue;
     }
-    if (at + 2 > bytes.length) {
-      throw new Error(`JPEG marker at byte ${mark} carries no length`);
+    if (offset + 2 > bytes.length) {
+      throw new Error(`entry.png is not a valid JPEG: marker 0x${marker.toString(16)} at byte ${start} has no length field`);
     }
-    const length = bytes.readUInt16BE(at);
-    if (length < 2 || at + length > bytes.length) {
-      throw new Error(`JPEG segment at byte ${at} declares an impossible length`);
+    const segmentLength = bytes.readUInt16BE(offset);
+    if (segmentLength < 2 || offset + segmentLength > bytes.length) {
+      throw new Error(
+        `entry.png is not a valid JPEG: segment at byte ${offset} declares ${segmentLength} bytes but only ${bytes.length - offset} remain`,
+      );
     }
     if (startsFrame(marker)) {
-      const components = bytes[at + 7];
-      if (length !== 8 + 3 * components || components < 1) {
-        throw new Error(`JPEG start-of-frame segment at byte ${at} is malformed`);
+      if (segmentLength < 8) {
+        throw new Error(
+          `entry.png is not a valid JPEG: start-of-frame at byte ${offset} is only ${segmentLength} bytes`,
+        );
       }
-      return { width: bytes.readUInt16BE(at + 5), height: bytes.readUInt16BE(at + 3) };
+      const components = bytes.readUInt8(offset + 7);
+      if (components < 1 || segmentLength !== 8 + 3 * components) {
+        throw new Error(
+          `entry.png is not a valid JPEG: start-of-frame at byte ${offset} declares ${segmentLength} bytes for ${components} components`,
+        );
+      }
+      return { width: bytes.readUInt16BE(offset + 5), height: bytes.readUInt16BE(offset + 3) };
     }
     if (marker === 0xda) {
-      inScan = true;
+      insideScan = true;
     }
-    at += length;
+    offset += segmentLength;
   }
-  throw new Error('JPEG has no start-of-frame segment');
+  throw new Error('entry.png is not a valid JPEG: no start-of-frame segment before the end of the file');
 }
 
-/**
- * An animated PNG carries an acTL chunk before its first frame, and a grader that saves only
- * the first frame would score a still of the page rather than the page. Chunks are walked by
- * their own length so only real chunk types are matched.
- */
-function pngIsAnimated(bytes: Buffer): boolean {
-  let at = 8;
-  while (at + 12 <= bytes.length) {
-    const length = bytes.readUInt32BE(at);
-    const type = bytes.toString('latin1', at + 4, at + 8);
-    if (type === 'acTL') {
-      return true;
-    }
-    if (type === 'IEND') {
-      return false;
-    }
-    at += 12 + length;
+/** Byte cap first, then the format gate, then the format's own header parse. */
+function inspect(bytes: Buffer): Geometry {
+  if (bytes.length > BYTES_MAX) {
+    throw new Error(`entry.png is ${bytes.length} bytes, over the ${BYTES_MAX} byte limit`);
   }
-  return false;
+  if (bytes.length >= PNG_MAGIC.length && bytes.subarray(0, PNG_MAGIC.length).equals(PNG_MAGIC)) {
+    const size = pngGeometry(bytes);
+    rejectAnimation(bytes);
+    return { format: 'png', width: size.width, height: size.height };
+  }
+  if (bytes.length >= JPEG_MAGIC.length && bytes.subarray(0, JPEG_MAGIC.length).equals(JPEG_MAGIC)) {
+    const size = jpegGeometry(bytes);
+    return { format: 'jpeg', width: size.width, height: size.height };
+  }
+  throw new Error('entry.png is neither a PNG nor a JPEG: the first bytes match no known signature');
 }
 
-function measure(bytes: Buffer): { format: string; size: Size } {
-  if (bytes.length > BYTE_LIMIT) {
-    throw new Error(`entry.png is ${bytes.length} bytes, past the ${BYTE_LIMIT} byte cap`);
+function assertSize(geometry: Geometry): void {
+  const { format, width, height } = geometry;
+  if (width < 1 || height < 1) {
+    throw new Error(
+      `entry.png (${format}) reports ${width}x${height}; both sides must be at least 1 pixel`,
+    );
   }
-  if (bytes.length >= 8 && bytes.subarray(0, 8).equals(PNG_SIGNATURE)) {
-    if (pngIsAnimated(bytes)) {
-      throw new Error('entry.png is an animated PNG; the page must be one still frame');
-    }
-    return { format: 'png', size: pngSize(bytes) };
+  if (width > SIDE_MAX || height > SIDE_MAX) {
+    throw new Error(
+      `entry.png (${format}) measures ${width}x${height}, over the ${SIDE_MAX}x${SIDE_MAX} cap`,
+    );
   }
-  if (bytes.length >= 3 && bytes.subarray(0, 3).equals(JPEG_SIGNATURE)) {
-    return { format: 'jpeg', size: jpegSize(bytes) };
-  }
-  throw new Error('entry.png is neither a PNG nor a JPEG');
 }
 
-function outputDir(): string {
-  const configured = (process.env.MAKEFUN_OUTPUT_DIR ?? '/output').trim();
-  if (configured === '') {
-    throw new Error('MAKEFUN_OUTPUT_DIR is set but empty');
+function outputDirectory(): string {
+  const configured = process.env.MAKEFUN_OUTPUT_DIR;
+  const wanted = configured === undefined ? '/output' : configured.trim();
+  if (wanted === '') {
+    throw new Error('MAKEFUN_OUTPUT_DIR is set but empty; it must name the output directory');
   }
-  return resolve(configured);
+  return resolve(wanted);
 }
 
-function main(): void {
+function deliver(): void {
   const here = dirname(fileURLToPath(import.meta.url));
   const source = join(here, 'entry.png');
+
   let bytes: Buffer;
   try {
     bytes = readFileSync(source);
-  } catch (error) {
-    throw new Error(`cannot read ${source}: ${(error as Error).message}`);
+  } catch (failure) {
+    throw new Error(`cannot read ${source}: ${(failure as Error).message}`);
   }
 
-  const { format, size } = measure(bytes);
-  if (size.width < 1 || size.height < 1) {
-    throw new Error(`entry.png measures ${size.width}x${size.height}, which is not an image`);
-  }
-  if (size.width > SIDE_LIMIT || size.height > SIDE_LIMIT) {
-    throw new Error(`entry.png measures ${size.width}x${size.height}, past ${SIDE_LIMIT}x${SIDE_LIMIT}`);
-  }
+  const geometry = inspect(bytes);
+  assertSize(geometry);
 
-  const target = join(outputDir(), 'entry.png');
+  const target = join(outputDirectory(), 'entry.png');
   mkdirSync(dirname(target), { recursive: true });
   writeFileSync(target, bytes);
-  console.log(`entry.png ${size.width}x${size.height} ${format} ${bytes.length} bytes -> ${target}`);
+
+  console.log(
+    `entry.png ${geometry.width}x${geometry.height} ${geometry.format} ${bytes.length} bytes -> ${target}`,
+  );
 }
 
 try {
-  main();
-} catch (error) {
-  console.error(`error: ${(error as Error).message}`);
+  deliver();
+} catch (failure) {
+  const message = failure instanceof Error ? failure.message : String(failure);
+  console.error(`error: ${message}`);
   process.exit(1);
 }
